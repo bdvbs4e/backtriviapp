@@ -372,6 +372,8 @@ io.on("connection", (socket) => {
     );
     await emitLobbyUpdate(io, room);
 
+
+    
     setTimeout(async () => {
       const stillDisconnected = room.players.find(
         (p) => p.socketId === socket.id && !p.connected
