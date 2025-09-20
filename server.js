@@ -1,3 +1,7 @@
+// Cambios claves:
+// 1. En player-join: no dejar entrar si ya hay 5 jugadores
+// 2. En player-ready: solo iniciar si === REQUIRED_PLAYERS y todos listos
+
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
@@ -40,7 +44,6 @@ const gameStatsService = require("./src/services/gameStats.service");
 
 let rooms = [];
 
-// 🔄 Restaurar salas persistentes
 (async () => {
   try {
     const existingGames = await Game.find({
@@ -107,7 +110,6 @@ async function findOrCreateRoom(forceNew = false) {
 }
 
 async function emitLobbyUpdate(io, room) {
-  // Guardar resultados de jugadores en la base de datos
   for (const player of room.players) {
     await playerResultService.createOrUpdatePlayerResult(room.roomId, {
       id: player.id,
@@ -121,14 +123,13 @@ async function emitLobbyUpdate(io, room) {
     });
   }
 
-  // Obtener resultados actualizados de la base de datos
   const dbResults = await playerResultService.getPlayerResultsByRoom(room.roomId);
   
   io.to(room.roomId).emit("lobby-update", {
     roomId: room.roomId,
     status: room.status,
     players: room.players,
-    dbResults: dbResults // Enviar también los resultados de la DB
+    dbResults
   });
   
   await Game.findOneAndUpdate(
@@ -145,7 +146,6 @@ async function emitLobbyUpdate(io, room) {
 }
 
 async function emitResultsUpdate(io, room) {
-  // Obtener resultados actualizados de la base de datos
   const dbResults = await playerResultService.getPlayerResultsByRoom(room.roomId);
   
   const winner = room.players ? room.players.find((p) => !p.eliminated) || null : null;
@@ -153,7 +153,7 @@ async function emitResultsUpdate(io, room) {
   
   io.to(room.roomId).emit("results-update", {
     players: room.players || [],
-    dbResults: dbResults,
+    dbResults,
     winner: winner || dbWinner,
   });
   emitDashboardUpdate();
@@ -162,26 +162,20 @@ async function emitResultsUpdate(io, room) {
 async function endGame(io, room) {
   room.status = "finished";
   const winner = room.players.find((p) => !p.eliminated) || null;
-
-  // Actualizar estado del juego en la base de datos
   await playerResultService.updateGameStatus(room.roomId, "finished");
 
-  // ✅ Actualizar estadísticas globales
   try {
-    const gameDuration = room.startedAt ? 
-      Math.floor((new Date() - room.startedAt) / 1000) : 0;
-    
+    const gameDuration = room.startedAt ? Math.floor((new Date() - room.startedAt) / 1000) : 0;
     await gameStatsService.updateStatsAfterGame({
       roomId: room.roomId,
       players: room.players,
       questions: room.questions,
-      gameDuration: gameDuration
+      gameDuration
     });
   } catch (error) {
     console.error("Error actualizando estadísticas globales:", error);
   }
 
-  // ✅ Emitir resultados inmediatamente a todos los clientes
   io.to(room.roomId).emit("game-over", {
     winner,
     players: room.players,
@@ -189,7 +183,6 @@ async function endGame(io, room) {
   });
   await emitResultsUpdate(io, room);
 
-  // ✅ Guardar historial en DB
   await Game.findOneAndUpdate(
     { roomId: room.roomId },
     {
@@ -200,7 +193,6 @@ async function endGame(io, room) {
     }
   );
 
-  // ✅ Eliminar la sala de memoria y de DB
   rooms = rooms.filter((r) => r.roomId !== room.roomId);
   await Game.findOneAndDelete({ roomId: room.roomId });
 
@@ -263,6 +255,12 @@ io.on("connection", (socket) => {
   socket.on("player-join", async (playerData) => {
     const room = await findOrCreateRoom(playerData.forceNew);
 
+    // 🚫 No dejar entrar más de 5 jugadores
+    if (room.players.length >= REQUIRED_PLAYERS) {
+      socket.emit("room-full", { message: "La sala ya tiene el máximo de jugadores (5)" });
+      return;
+    }
+
     let existing = room.players.find((p) => p.id === playerData.id);
     if (existing) {
       existing.connected = true;
@@ -293,7 +291,8 @@ io.on("connection", (socket) => {
 
     await emitLobbyUpdate(io, room);
 
-    const allReady = room.players.length >= 2 && room.players.every((p) => p.ready);
+    // ✅ Solo iniciar si son EXACTAMENTE 5 y todos listos
+    const allReady = room.players.length === REQUIRED_PLAYERS && room.players.every((p) => p.ready);
 
     if (allReady && room.status !== "started") {
       room.status = "started";
@@ -326,7 +325,6 @@ io.on("connection", (socket) => {
       return p;
     });
 
-    // Actualizar puntuación en la base de datos
     const player = room.players.find((p) => p.id === playerId);
     if (player) {
       await playerResultService.updatePlayerScore(roomId, playerId, player.score);
@@ -376,20 +374,18 @@ io.on("connection", (socket) => {
 
   socket.on("get-results", async ({ roomId }) => {
     try {
-      // Obtener resultados de la base de datos
       const dbResults = await playerResultService.getPlayerResultsByRoom(roomId);
       
       if (dbResults && dbResults.length > 0) {
         const winner = dbResults.find((p) => !p.eliminated) || null;
         socket.emit("results-update", {
           players: dbResults,
-          dbResults: dbResults,
+          dbResults,
           winner,
         });
         return;
       }
 
-      // Fallback a la sala en memoria si no hay datos en DB
       const room = rooms.find((r) => r.roomId === roomId);
       if (room) {
         const winner = room.players.find((p) => !p.eliminated) || null;
@@ -400,7 +396,6 @@ io.on("connection", (socket) => {
         return;
       }
 
-      // Fallback a la base de datos de juegos
       const dbGame = await Game.findOne({ roomId });
       if (dbGame) {
         const winner = (dbGame.players || []).find((p) => !p.eliminated) || null;
