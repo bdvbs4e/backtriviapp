@@ -1,6 +1,7 @@
 // Cambios claves:
 // 1. En player-join: no dejar entrar si ya hay 5 jugadores
 // 2. En player-ready: solo iniciar si === REQUIRED_PLAYERS y todos listos
+// 3. En endGame: NO borrar la sala, resetearla a waiting para que los mismos 5 puedan seguir jugando
 
 require("dotenv").config();
 const express = require("express");
@@ -44,6 +45,7 @@ const gameStatsService = require("./src/services/gameStats.service");
 
 let rooms = [];
 
+// 🔄 Restaurar salas persistentes
 (async () => {
   try {
     const existingGames = await Game.find({
@@ -183,18 +185,29 @@ async function endGame(io, room) {
   });
   await emitResultsUpdate(io, room);
 
+  // 🔁 En lugar de borrar la sala, la reseteamos para que los mismos 5 puedan seguir jugando
+  room.status = "waiting";
+  room.players = room.players.map((p) => ({
+    ...p,
+    ready: false,
+    eliminated: false,
+    score: 0,
+    answered: false
+  }));
+  room.questions = [];
+  room.currentQuestionIndex = 0;
+  room.startedAt = null;
+
   await Game.findOneAndUpdate(
     { roomId: room.roomId },
     {
-      status: "finished",
+      status: "waiting",
       players: room.players,
+      questionsLog: [],
+      currentQuestionIndex: 0,
       finishedAt: new Date(),
-      questionsLog: room.questions,
     }
   );
-
-  rooms = rooms.filter((r) => r.roomId !== room.roomId);
-  await Game.findOneAndDelete({ roomId: room.roomId });
 
   emitDashboardUpdate();
 }
@@ -255,7 +268,6 @@ io.on("connection", (socket) => {
   socket.on("player-join", async (playerData) => {
     const room = await findOrCreateRoom(playerData.forceNew);
 
-    // 🚫 No dejar entrar más de 5 jugadores
     if (room.players.length >= REQUIRED_PLAYERS) {
       socket.emit("room-full", { message: "La sala ya tiene el máximo de jugadores (5)" });
       return;
@@ -283,7 +295,7 @@ io.on("connection", (socket) => {
   socket.on("player-ready", async (playerId) => {
     const room = rooms.find((r) => r.players.some((p) => p.id === playerId));
     if (!room) return;
-    if (room.status === "started" || room.status === "finished") return;
+    if (room.status === "started") return;
 
     room.players = room.players.map((p) =>
       p.id === playerId ? { ...p, ready: true } : p
@@ -291,7 +303,6 @@ io.on("connection", (socket) => {
 
     await emitLobbyUpdate(io, room);
 
-    // ✅ Solo iniciar si son EXACTAMENTE 5 y todos listos
     const allReady = room.players.length === REQUIRED_PLAYERS && room.players.every((p) => p.ready);
 
     if (allReady && room.status !== "started") {
